@@ -1,0 +1,809 @@
+---
+title: "Targeting poverty in Costa Rica: predicting which households are poor"
+author: "Hermann and Zoltan"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 3.8)
+
+# install the packages that are missing, then load all of them
+needed <- c("ggplot2", "caret", "glmnet", "randomForest", "gbm", "pROC", "doParallel")
+missing <- needed[!(needed %in% rownames(installed.packages()))]
+if (length(missing) > 0) install.packages(missing, repos = "https://cloud.r-project.org")
+invisible(lapply(needed, library, character.only = TRUE))
+
+# creates three objects (see 01_clean_data.R):
+#   costa_rica        readable version, categories are factors (exploratory analysis)
+#   costa_rica_model  numeric version, one 0/1 column per category (models)
+#   removed_cols      the 0/1 columns removed because of too few households
+load("data/costa_rica_clean.RData")
+```
+
+# 1. Application context
+
+Governments want to direct social transfers to the poorest households. In Latin America
+many workers are informal, so income is hard to verify. Countries therefore use *proxy
+means tests*: they predict poverty from observable household characteristics (dwelling,
+assets, household composition, education) instead of income (Caruso, Galiani and
+Weinschelbaum, 2019).
+
+**Data.** Household survey from Costa Rica (Inter-American Development Bank, released on
+Kaggle: "Costa Rican Household Poverty Level Prediction"). The original data has one row per
+person (9,557 persons in 2,988 households). Because the poverty label belongs to the
+household, we keep **one row per household (the household head)**. Otherwise members of the
+same household could end up in both the training and the test data. After cleaning we have
+**`r format(nrow(costa_rica), big.mark = ",")` households and `r ncol(costa_rica) - 1`
+predictors**.
+
+**Task.** Classification: is a household *poor* (extreme or moderate poverty) or *not poor*
+(vulnerable or non-vulnerable)? This mirrors the decision of a targeting programme: is the
+household eligible or not? The label `poor` is known for every household in the survey. We
+use it to train the models and to check them on households that the models have not seen.
+
+**Why the type of error matters.** Classifying a poor household as not poor excludes it from
+support. Classifying a non-poor household as poor wastes resources. Which error is worse is a
+policy choice, so besides the error rate we use sensitivity, specificity and the AUC.
+
+**Related work.** Kim (2021) fits a random forest and gradient boosted trees to the original
+four-class problem on the same data and also finds education to be the most important
+predictor. Our set-up differs (binary target, one row per household).
+
+# 2. The data: variables and meaning
+
+`head_` refers to the household head, `n_` means "number of". In the exploratory analysis
+categorical variables are factors (one variable instead of many 0/1 columns).
+
+| Group | Variables | Meaning | Why we expect it to matter |
+|---|---|---|---|
+| Household head | `head_age`, `head_male`, `head_marital_status`, `head_education_level`, `head_years_schooling`, `head_disabled` | Characteristics of the head | Education is the classic driver of earnings; female-headed households are often poorer |
+| Composition | `household_size`, `persons_living_in_dwelling`, `n_children_0_19`, `n_seniors_65plus`, `n_males_under12`, `n_males_12plus`, `n_females_under12`, `n_females_12plus`, `dependency_rate`, `mean_years_schooling_adults` | Size and age structure; dependency rate = (members under 19 or over 64) / members aged 19-64; average schooling of adults | Many dependants per earner and low adult education mean low income per person |
+| Dwelling | `n_rooms`, `n_bedrooms`, `persons_per_bedroom`, `overcrowded_bedrooms`, `overcrowded_rooms`, `housing_tenure`, `monthly_rent`, `wall_material`, `wall_quality`, `roof_material`, `roof_quality`, `has_ceiling`, `floor_material`, `floor_quality` | Size, crowding, tenure and building quality | Dwelling quality is the core of a proxy means test |
+| Services | `water_supply`, `electricity_source`, `toilet_type`, `has_toilet`, `cooking_energy`, `rubbish_disposal` | Access to water, electricity, sanitation, cooking fuel, waste collection | Lack of basic services signals deprivation |
+| Assets | `has_refrigerator`, `has_computer`, `has_television`, `n_tablets`, `n_mobile_phones` | Durable goods | Assets are a direct proxy of wealth |
+| Location | `region`, `urban` | Planning region; urban (1) or rural (0) | Regional and rural-urban gaps in development |
+| **Target** | `poor` | `poor` = original groups 1-2, `not_poor` = groups 3-4 | |
+
+```{r overview}
+predictors <- setdiff(names(costa_rica), "poor")
+X <- costa_rica[predictors]
+
+# type of each predictor: categorical (factor), binary (0/1) or numeric
+var_type <- sapply(X, function(x) {
+  if (is.factor(x)) "categorical"
+  else if (all(x %in% c(0, 1))) "binary 0/1"
+  else "numeric"
+})
+table(var_type)
+
+# helper: to which original variable does a column of the model data belong?
+# (e.g. "wall_material_wood" -> "wall_material"; numeric columns keep their name)
+col_to_var <- function(cols) {
+  sapply(cols, function(cn) {
+    hits <- predictors[startsWith(cn, predictors)]
+    hits[which.max(nchar(hits))]
+  }, USE.NAMES = FALSE)
+}
+
+dim(costa_rica)          # readable version: households x (predictors + poor)
+dim(costa_rica_model)    # model version:    households x (columns + poor)
+sum(is.na(costa_rica)) + sum(is.na(costa_rica_model))   # missing values left
+```
+
+In the model version every category is its own 0/1 column named `<variable>_<category>`, for
+example `wall_material_wood` = 1 if the walls are made of wood, 0 otherwise.
+
+## Data cleaning (script `01_clean_data.R`)
+
+| Step | Decision | Reason |
+|---|---|---|
+| Unit of observation | Kept only the household head (9,557 persons -> 2,973 households) | The poverty label is a household outcome. Several rows per household would put the same household in training and test data (leakage). |
+| Households without a head | 15 of 2,988 households dropped (0.5%) | They have no head row to keep. |
+| Target | Built `poor` from the head's 4-class group and removed the 4-class variable | A binary target is simpler and mirrors the eligibility decision. Keeping the 4-class variable would predict `poor` perfectly (leakage). In 85 households the members disagree on the group, so we use the head's. |
+| Text values | "yes"/"no" in `dependency_rate` set to 1/0 | Checked against the squared columns of the original data. |
+| Structural missing values | `monthly_rent` and `n_tablets` set to 0 when missing | They are missing exactly when the household pays no rent / owns no tablet, so 0 is the true value. |
+| Other missing values | 3 households without adult schooling dropped; `rez_esc` (missing for all but one head) removed | Dropping 3 of 2,973 rows is negligible. `rez_esc` is only defined for school-age persons. |
+| Redundant columns | Removed squared copies, exact sums of other columns, duplicates and constant columns | They add no information and only create collinearity. |
+| Categories | Merged the 0/1 columns of one characteristic into one factor (for example `wall_material`) with readable labels; households in none of the listed categories get the label `not_recorded` | Easier to read. These are hidden missing values (for example `roof_material` 19 households). |
+| Dummy variables | Model data: one 0/1 column for every category, no reference category | Every category gets its own coefficient, which is easy to interpret and compare. |
+| Rare columns | 0/1 columns in which one value occurs in fewer than 30 households are removed | The effect of such a column cannot be estimated reliably (with 22% poor, 30 households contain only about 7 poor ones). No household is removed and the target is not used. |
+
+**Result:** `r nrow(costa_rica)` households, `r ncol(costa_rica) - 1` predictors in the
+readable data (`r sum(var_type == "categorical")` categorical, `r sum(var_type == "binary 0/1")`
+binary, `r sum(var_type == "numeric")` numeric) and `r ncol(costa_rica_model) - 1` 0/1 or
+numeric columns in the model data. No missing values, one row per household.
+
+**What we can rely on:** each household appears once, the target is consistent with the
+variables, the only recodings of values ("yes"/"no", structural zeros) were checked against
+other columns, and no predictor contains information on the target (no leakage). Nothing was
+removed because of its relation to poverty; variable selection is left to the models,
+inside cross-validation.
+
+**Limitations (kept on purpose):**
+
+* The data describe the household head and the dwelling, not every member.
+* The classes are imbalanced (22% poor).
+* Some columns are strongly correlated (see section 6.2).
+* Rent is skewed and the dependency rate is capped.
+
+# 3. The target
+
+```{r target}
+table(costa_rica$poor)
+round(100 * prop.table(table(costa_rica$poor)), 1)
+ggplot(costa_rica, aes(poor, fill = poor)) + geom_bar() +
+  labs(x = NULL, y = "Households") + theme(legend.position = "none")
+```
+
+`r round(100 * mean(costa_rica$poor == "poor"))`% of the households are poor
+(`r sum(costa_rica$poor == "poor")` of `r nrow(costa_rica)`). The rule "nobody is poor" is
+already right for `r round(100 * mean(costa_rica$poor == "not_poor"))`% of the households, so
+**accuracy alone is misleading**. We evaluate with sensitivity, specificity and AUC.
+
+# 4. Who is poor? Descriptive analysis
+
+```{r helper}
+overall <- 100 * mean(costa_rica$poor == "poor")
+
+# bar chart of the poverty rate for each group, with the number of households (n)
+plot_rate <- function(group, title) {
+  d <- data.frame(group = group, poor = costa_rica$poor == "poor")
+  d <- d[!is.na(d$group), ]
+  r <- aggregate(poor ~ group, d, function(x) c(rate = 100 * mean(x), n = length(x)))
+  r <- data.frame(group = r$group, rate = r$poor[, "rate"], n = r$poor[, "n"])
+  ggplot(r, aes(reorder(group, rate), rate)) + geom_col() +
+    geom_text(aes(label = paste0("n=", n)), hjust = -0.1, size = 3) +
+    geom_hline(yintercept = overall, linetype = "dashed") +
+    coord_flip() + scale_y_continuous(limits = c(0, 100)) +
+    labs(x = NULL, y = "Poverty rate (%)", title = title, subtitle = "dashed: overall rate")
+}
+```
+
+**Education, region, area and sex of the head**
+
+```{r groups}
+# education of the head in 5 groups (the household with level "not_recorded" is left out)
+edu_map <- c(none = "none / incomplete primary",
+             incomplete_primary = "none / incomplete primary",
+             complete_primary = "complete primary",
+             incomplete_secondary = "incomplete secondary",
+             incomplete_technical_secondary = "incomplete secondary",
+             complete_secondary = "complete secondary",
+             complete_technical_secondary = "complete secondary",
+             undergraduate_or_higher = "higher",
+             postgraduate = "higher")
+edu_group <- unname(edu_map[as.character(costa_rica$head_education_level)])
+
+plot_rate(edu_group, "By education of the head")
+plot_rate(costa_rica$region, "By region")
+plot_rate(ifelse(costa_rica$urban == 1, "urban", "rural"), "Urban vs rural")
+plot_rate(ifelse(costa_rica$head_male == 1, "male head", "female head"), "By sex of the head")
+```
+
+**Assets and dwelling**
+
+```{r assets}
+# for each 0/1 indicator: poverty rate of households with (=1) and without (=0)
+assets <- data.frame(
+  has_computer         = costa_rica$has_computer,
+  has_tablet           = as.numeric(costa_rica$n_tablets > 0),
+  has_refrigerator     = costa_rica$has_refrigerator,
+  has_television       = costa_rica$has_television,
+  has_ceiling          = costa_rica$has_ceiling,
+  overcrowded_bedrooms = costa_rica$overcrowded_bedrooms)
+long <- do.call(rbind, lapply(names(assets), function(v)
+  data.frame(var = v, has = ifelse(assets[[v]] == 1, "yes (=1)", "no (=0)"),
+             poor = costa_rica$poor == "poor")))
+res_assets <- aggregate(poor ~ var + has, long, function(x) 100 * mean(x))
+ggplot(res_assets, aes(var, poor, fill = has)) + geom_col(position = "dodge") +
+  coord_flip() + labs(x = NULL, y = "Poverty rate (%)", fill = NULL)
+
+plot_rate(costa_rica$floor_quality, "By floor quality")
+plot_rate(costa_rica$housing_tenure, "By type of tenure")
+```
+
+**Numeric variables**
+
+```{r numeric}
+num_vars <- c("head_years_schooling", "mean_years_schooling_adults",
+              "persons_per_bedroom", "n_children_0_19",
+              "household_size", "dependency_rate")
+summary(costa_rica[num_vars])
+long <- data.frame(poor  = rep(costa_rica$poor, length(num_vars)),
+                   var   = rep(num_vars, each = nrow(costa_rica)),
+                   value = unlist(costa_rica[num_vars], use.names = FALSE))
+ggplot(long, aes(poor, value, fill = poor)) + geom_boxplot() +
+  facet_wrap(~ var, scales = "free_y") + labs(x = NULL, y = NULL) +
+  theme(legend.position = "none")
+```
+
+# 5. Which variables are most related to poverty?
+
+We use the model data, in which every category is its own 0/1 column. Each category then
+gets its own correlation with `poor` (1 = poor). A correlation has no units, so numeric
+variables and categories can be compared directly. Positive = more often poor.
+
+```{r correlations}
+Xd <- as.matrix(costa_rica_model[, setdiff(names(costa_rica_model), "poor")])
+Xd <- Xd[, apply(Xd, 2, sd) > 0]                      # drop constant columns
+y  <- as.numeric(costa_rica_model$poor == "poor")
+cors <- apply(Xd, 2, function(x) cor(x, y))
+
+top <- head(cors[order(-abs(cors))], 12)
+ggplot(data.frame(var = names(top), r = top), aes(reorder(var, abs(r)), r)) +
+  geom_col() + coord_flip() + labs(x = NULL, y = "Correlation with poor")
+```
+
+The same information with one line per original variable (its strongest column):
+
+```{r correlations-by-variable}
+by_var <- split(cors, col_to_var(names(cors)))        # correlations grouped by variable
+cor_tab <- data.frame(
+  variable         = names(by_var),
+  strongest_column = sapply(by_var, function(r) names(r)[which.max(abs(r))]),
+  correlation      = sapply(by_var, function(r) r[which.max(abs(r))]),
+  row.names = NULL)
+cor_tab$type <- unname(var_type[cor_tab$variable])
+cor_tab$correlation <- round(cor_tab$correlation, 3)
+cor_tab <- cor_tab[order(-abs(cor_tab$correlation)),
+                   c("variable", "type", "strongest_column", "correlation")]
+knitr::kable(head(cor_tab, 15), row.names = FALSE,
+             caption = "Strongest correlation with poverty for each variable")
+```
+
+These are simple associations that ignore all other variables.
+
+# 6. Issues for the modelling stage
+
+## 6.1 Rare categories (already handled in the cleaning step)
+
+Some categories contain very few households. The effect of such a category cannot be
+estimated reliably: with 22% poor households, a category of 30 households contains only about
+7 poor ones. In the cleaning script we therefore removed every 0/1 column in which one of the
+two values occurs in fewer than 30 households.
+
+**No household was removed.** The households of a removed category stay in the data with 0 in
+all remaining columns of that variable. Removing the households themselves would drop some
+of the most deprived ones (for example no floor or no electricity), exactly the cases a
+targeting programme most needs to find.
+
+```{r category-counts}
+cat_vars <- predictors[sapply(costa_rica[predictors], is.factor)]
+counts <- do.call(rbind, lapply(cat_vars, function(v) {
+  t <- table(costa_rica[[v]])
+  data.frame(variable = v, category = names(t), n = as.integer(t),
+             share_pct = round(100 * as.numeric(t) / nrow(costa_rica), 1))
+}))
+counts <- counts[order(counts$n), ]
+rownames(counts) <- NULL
+knitr::kable(head(counts, 15), caption = "The 15 rarest categories (readable data, before removal)")
+
+knitr::kable(removed_cols, caption = "0/1 columns removed (fewer than 30 households)")
+```
+
+`r nrow(removed_cols)` columns were removed. The model data have
+`r ncol(costa_rica_model) - 1` columns (predictors), all with at least 30 households in each
+of their two values.
+
+## 6.2 Strongly correlated columns
+
+```{r issues}
+cm <- cor(Xd)
+h <- which(abs(cm) >= 0.9 & upper.tri(cm), arr.ind = TRUE)
+high_pairs <- data.frame(var1 = rownames(cm)[h[, 1]], var2 = colnames(cm)[h[, 2]],
+                         r = round(cm[h], 3))
+high_pairs                                     # pairs with |correlation| >= 0.9
+mean(costa_rica$monthly_rent > 0)              # share of households paying rent
+```
+
+`r nrow(high_pairs)` pairs of columns have an absolute correlation of at least 0.9 (mostly
+categories of the same variable, and household size with persons living in the dwelling).
+Regularization (lasso, ridge) handles this, and trees are not affected. Only
+`r round(100 * mean(costa_rica$monthly_rent > 0), 1)`% of the households pay rent (for the
+others the value is 0).
+
+# 7. Main findings of the exploratory analysis
+
+```{r key-numbers, echo=FALSE}
+pr <- function(idx) 100 * mean(costa_rica$poor[idx] == "poor")   # poverty rate in %
+r_edu_low  <- pr(which(edu_group == "none / incomplete primary"))
+r_edu_high <- pr(which(edu_group == "higher"))
+reg        <- tapply(costa_rica$poor == "poor", costa_rica$region, mean) * 100
+r_central  <- reg["Central"]
+r_other    <- range(reg[names(reg) != "Central"])
+r_comp_yes <- pr(which(costa_rica$has_computer == 1))
+r_comp_no  <- pr(which(costa_rica$has_computer == 0))
+r_rural    <- pr(which(costa_rica$urban == 0))
+r_urban    <- pr(which(costa_rica$urban == 1))
+r_female   <- pr(which(costa_rica$head_male == 0))
+r_male     <- pr(which(costa_rica$head_male == 1))
+```
+
+* **`r round(overall)`% of households are poor**: the classes are imbalanced, so accuracy
+  alone is not informative.
+* **Education is the strongest signal.** The poverty rate falls from
+  `r round(r_edu_low)`% (head with no or incomplete primary education) to
+  `r round(r_edu_high)`% (higher education). The variable with the strongest correlation to
+  `poor` is `r cor_tab$variable[1]` (`r cor_tab$correlation[1]`).
+* **Dwelling quality and assets matter.** Poverty is `r round(r_comp_yes)`% in households with
+  a computer against `r round(r_comp_no)`% without. Households with bad floors or walls or no
+  ceiling are also poorer (see the plots above).
+* **Geography and sex of the head.** `r round(r_central)`% poor in the Central region against
+  `r round(r_other[1])`-`r round(r_other[2])`% in the other regions; rural `r round(r_rural)`%
+  against urban `r round(r_urban)`%; female-headed `r round(r_female)`% against male-headed
+  `r round(r_male)`%.
+* **No single variable is a strong predictor**: the largest absolute correlation is
+  `r round(max(abs(cors)), 2)`. We need models that combine many variables.
+* **Modelling implications.** The `r length(predictors)` predictors become
+  `r ncol(Xd)` model columns when every category gets its own 0/1 column;
+  `r nrow(high_pairs)` pairs of columns are strongly correlated. This motivates
+  regularization (lasso) and variable selection inside cross-validation. Trees and boosting
+  handle the skewed rent and the capped dependency rate without transformation.
+
+**Sources.** Caruso, M., Galiani, S., Weinschelbaum, F. (2019). *Poverty Alleviation
+Strategies Under Informality: Evidence for Latin America.* NBER Working Paper 26339.
+Kim, J. Y. (2021). *Using Machine Learning to Predict Poverty Status in Costa Rican
+Households.* arXiv:2111.13319. Data: Inter-American Development Bank via Kaggle.
+
+# 8. Pre-processing and variable selection prior to the analysis
+
+**Already done in the cleaning step** (it does not use the outcome, so there is no leakage):
+one row per household; "yes"/"no" recoded; structural missing values set to 0; squared
+copies, exact sums, duplicates and constant columns removed; one 0/1 column for every
+category; 0/1 columns with fewer than 30 households removed.
+
+**Steps before the models**
+
+1. **Train/test split (70/30, stratified).** Following unit 4, we hold out a test set for the
+   final assessment of the chosen model. The data set is not large, so tuning and model
+   selection use 10-fold cross-validation on the training set instead of a separate validation
+   set. The split is done first, with a fixed seed, and keeps the share of poor households in
+   both parts. The test set is used only once, at the end.
+2. **Encoding.** The model data already contain one 0/1 column per category, so all methods
+   see exactly the same numeric matrix. Columns that are constant in the training set are
+   removed.
+3. **Scaling.** The penalty of the lasso depends on the scale of the variables, so they are
+   standardized (`glmnet` does this internally and reports coefficients on the original
+   scale). Trees and boosting are not affected by scale.
+4. **Skewed variables (rent, dependency rate).** Left unchanged: tree-based methods are
+   invariant to monotone transformations, and the penalty handles the rest.
+5. **Class imbalance (22% poor).** We keep the natural class frequencies and evaluate with
+   AUC, sensitivity and specificity instead of accuracy. The classification threshold can be
+   adjusted afterwards (unit 4).
+6. **Variable selection.** We do not drop variables by hand. Selecting variables by their
+   relation to the outcome and then cross-validating would give an optimistic error (unit 4).
+   Selection is part of the methods: the lasso sets coefficients exactly to zero, and for
+   random forest and boosting we use variable importance. Everything is tuned by
+   cross-validation on the training set only.
+
+```{r preprocessing}
+set.seed(2026)
+
+# 1. stratified 70/30 split (same share of poor households in both parts)
+idx_poor <- which(costa_rica$poor == "poor")
+idx_not  <- which(costa_rica$poor == "not_poor")
+train_id <- c(sample(idx_poor, round(0.7 * length(idx_poor))),
+              sample(idx_not,  round(0.7 * length(idx_not))))
+train <- costa_rica[train_id, ]      # same households, same order as costa_rica_model
+test  <- costa_rica[-train_id, ]
+table(train$poor); table(test$poor)
+round(100 * prop.table(table(train$poor)), 1)
+round(100 * prop.table(table(test$poor)), 1)
+
+# 2. input matrices from the model data (one 0/1 column per category)
+x_all   <- as.matrix(costa_rica_model[, setdiff(names(costa_rica_model), "poor")])
+x_train <- x_all[train_id, ]
+x_test  <- x_all[-train_id, ]
+y_train <- train$poor
+y_test  <- test$poor
+
+# columns that are constant in the training set carry no information
+keep <- apply(x_train, 2, sd) > 0
+x_train <- x_train[, keep]
+x_test  <- x_test[, keep]
+dim(x_train)                         # training households x columns
+```
+
+# 9. Predictive models: lasso, random forest and boosting
+
+We fit three methods from class to predict `poor`. All three use the same inputs (`x_train`,
+`y_train`) and the same 10-fold cross-validation folds on the training set, so the comparison
+is fair. The test set is not touched here.
+
+| Method | Unit | Hyperparameters tuned by 10-fold CV |
+|---|---|---|
+| Logistic regression with lasso penalty (package glmnet) | 2-3 | penalty lambda |
+| Random forest (package randomForest) | 6 | mtry (variables tried per split) |
+| Boosting, gradient boosted trees (package gbm) | 7 | number of trees, tree depth, learning rate |
+
+The tuning criterion is the AUC (area under the ROC curve), because the classes are
+imbalanced and accuracy would be misleading.
+
+## Step 1: Common set-up
+
+A **hyperparameter** is a setting that the method does not learn from the data, and we have
+to choose it. For each candidate value we fit on 9 folds, measure the AUC on the 10th fold, and
+average over the 10 rounds. The folds are fixed once, so all methods are compared on exactly
+the same folds. The folds run in parallel on several cores to save time.
+
+The fitted models are saved in the folder `models`. If a saved model exists, it is loaded
+instead of being fitted again. (Delete the folder `models` to refit everything, for example
+after changing the data or the tuning grids.)
+
+```{r cv-setup}
+set.seed(2026)
+folds <- createFolds(y_train, k = 10, returnTrain = TRUE)   # stratified folds
+
+ctrl <- trainControl(
+  method = "cv", number = 10, index = folds,   # same 10 folds for every method
+  classProbs = TRUE,                           # probabilities are needed for the AUC
+  summaryFunction = twoClassSummary)           # reports AUC ("ROC"), Sens, Spec
+```
+
+```{r helper-load-or-fit}
+dir.create("models", showWarnings = FALSE)      # folder for the fitted models
+
+# fits a model only if no saved file exists; otherwise loads the saved model
+load_or_fit <- function(file, fit_expr) {
+  path <- file.path("models", file)
+  if (file.exists(path)) {
+    message("Loading saved model: ", path)
+    return(readRDS(path))
+  }
+  fit <- fit_expr                               # the model is fitted here, only when needed
+  saveRDS(fit, path)
+  fit
+}
+```
+
+```{r parallel-start}
+cl <- makePSOCKcluster(max(1, parallel::detectCores() - 1))   # all cores but one
+registerDoParallel(cl)
+```
+
+## Step 2: Model 1 - Logistic regression with lasso penalty
+
+The lasso fits a logistic regression and adds a penalty on the sum of the absolute values of
+the coefficients. A larger lambda shrinks more, and weak variables get a coefficient of
+exactly zero. A small lambda means little penalty (risk of overfitting); a large lambda
+removes many variables (risk of underfitting). We try 30 values of lambda and keep the best one
+by cross-validated AUC. (`alpha = 1` means lasso; the variables are standardized internally.)
+
+```{r lasso}
+set.seed(2026)
+fit_lasso <- load_or_fit("fit_lasso.rds", train(
+  x = x_train, y = y_train,
+  method = "glmnet",
+  metric = "ROC",                              # choose lambda by cross-validated AUC
+  trControl = ctrl,
+  tuneGrid = expand.grid(alpha = 1,            # alpha = 1: lasso
+                         lambda = 10^seq(-4, -1, length.out = 30))))
+
+fit_lasso$bestTune                             # chosen lambda
+plot(fit_lasso)                                # CV-AUC for each lambda
+```
+
+How many columns does the lasso keep (coefficient not exactly zero)?
+
+```{r lasso-kept}
+cf_all <- as.matrix(coef(fit_lasso$finalModel, s = fit_lasso$bestTune$lambda))[-1, 1]
+c(columns_total = length(cf_all), columns_kept = sum(cf_all != 0))
+```
+
+A positive coefficient raises the probability of being poor, a negative one lowers it,
+holding the other variables fixed. The coefficients are discussed in section 12.
+
+## Step 3: Model 2 - Random forest
+
+A random forest grows many decision trees, each on a random bootstrap sample of the
+households. At each split a tree may only look at a random subset of `mtry` variables. The
+final prediction is the vote of all trees, which is much more stable than a single tree
+(averaging reduces variance). We use 300 trees and tune `mtry`: a small `mtry` makes the
+trees different from each other, a large `mtry` makes each tree stronger but more similar.
+
+```{r random-forest}
+set.seed(2026)
+fit_rf <- load_or_fit("fit_rf.rds", train(
+  x = x_train, y = y_train,
+  method = "rf",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneGrid = data.frame(mtry = c(3, 6, 10, 15)),
+  ntree = 300))
+
+fit_rf$bestTune                                # chosen mtry
+plot(fit_rf)                                   # CV-AUC for each mtry
+```
+
+Which variables matter most for the forest?
+
+```{r rf-importance}
+imp_rf <- varImp(fit_rf, scale = TRUE)$importance
+imp_rf <- imp_rf[order(-imp_rf$Overall), , drop = FALSE]
+knitr::kable(head(imp_rf, 15), digits = 1, caption = "Random forest: variable importance (100 = most important)")
+```
+
+## Step 4: Model 3 - Boosting
+
+Boosting also uses trees, but builds them one after another: each small tree is fit to the
+mistakes of the current model, and its contribution is added with a small weight (the learning
+rate). Each step improves the model a little (boosting reduces bias). We tune three
+hyperparameters:
+
+* `n.trees`: number of trees (too many can overfit),
+* `interaction.depth`: size of each tree (1 = single splits only, 3 = up to three variables
+  interact),
+* `shrinkage`: learning rate (small = slow, careful learning, needs more trees).
+
+```{r boosting}
+set.seed(2026)
+fit_gbm <- load_or_fit("fit_gbm.rds", train(
+  x = x_train, y = y_train,
+  method = "gbm",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneGrid = expand.grid(n.trees = c(100, 300, 500),
+                         interaction.depth = c(1, 2, 3),
+                         shrinkage = c(0.01, 0.05),
+                         n.minobsinnode = 10),   # minimum households per leaf (fixed)
+  verbose = FALSE))
+
+fit_gbm$bestTune                               # chosen combination
+plot(fit_gbm)                                  # CV-AUC for each combination
+```
+
+```{r gbm-importance}
+imp_gbm <- varImp(fit_gbm, scale = TRUE)$importance
+imp_gbm <- imp_gbm[order(-imp_gbm$Overall), , drop = FALSE]
+knitr::kable(head(imp_gbm, 15), digits = 1, caption = "Boosting: variable importance (100 = most important)")
+```
+
+```{r parallel-stop}
+stopCluster(cl)                                # release the cores
+registerDoSEQ()
+```
+
+## Step 5: Comparison of the three methods (cross-validation, training set)
+
+Every method is shown with its best hyperparameters. The numbers are 10-fold CV estimates
+computed on the same folds. The AUC ("ROC") is the main criterion. In this output "Sens" is the
+share of not-poor households correctly found and "Spec" the share of poor households correctly
+found, because caret treats the first factor level (not_poor) as the event. We therefore only
+use the AUC here, and compute sensitivity and specificity of the poor class on the test set.
+
+```{r comparison}
+res <- resamples(list(Lasso = fit_lasso, RandomForest = fit_rf, Boosting = fit_gbm))
+summary(res)
+bwplot(res, metric = "ROC")                    # the 10 AUC values of each method
+```
+
+# 10. Model selection
+
+We compare the three methods with the cross-validated AUC on the training set. All three
+were evaluated on exactly the same 10 folds, so the comparison is fair and the test set plays
+no role in the choice.
+
+```{r selection}
+cv_table <- data.frame(
+  Method = c("Lasso", "Random forest", "Boosting"),
+  Best_hyperparameters = c(
+    paste0("lambda = ", signif(fit_lasso$bestTune$lambda, 3)),
+    paste0("mtry = ", fit_rf$bestTune$mtry),
+    paste0(fit_gbm$bestTune$n.trees, " trees, depth ",
+           fit_gbm$bestTune$interaction.depth, ", learning rate ",
+           fit_gbm$bestTune$shrinkage)),
+  CV_AUC_mean = c(mean(res$values[["Lasso~ROC"]]),
+                  mean(res$values[["RandomForest~ROC"]]),
+                  mean(res$values[["Boosting~ROC"]])),
+  CV_AUC_sd = c(sd(res$values[["Lasso~ROC"]]),
+                sd(res$values[["RandomForest~ROC"]]),
+                sd(res$values[["Boosting~ROC"]])))
+cv_table[3:4] <- round(cv_table[3:4], 3)
+knitr::kable(cv_table, row.names = FALSE, caption = "Cross-validated AUC on the training set")
+
+# paired differences between methods over the 10 folds (t-tests, Bonferroni adjusted)
+summary(diff(res, metric = "ROC"))
+```
+
+The cross-validated AUC is `r min(cv_table$CV_AUC_mean)` to `r max(cv_table$CV_AUC_mean)` for
+the three methods, and the standard deviation across folds is about
+`r round(mean(cv_table$CV_AUC_sd), 3)`. The differences between the methods are small compared
+with this variation (see the paired tests), so we cannot say that one method predicts better
+than the others. We therefore choose by **parsimony**: the **lasso** is the simplest model, it
+is a linear model with coefficients that can be interpreted, and it predicts about as well as
+the flexible tree ensembles. This also suggests that non-linear effects and interactions, which
+the forest and boosting can capture, add little predictive power here.
+
+**Check: ridge instead of lasso.** Ridge uses the same logistic regression with a penalty on
+the sum of squared coefficients: it keeps all variables and shrinks correlated columns
+together (unit 2). We tune it on the same folds to see whether it would be a better linear
+model.
+
+```{r ridge-check}
+set.seed(2026)
+fit_ridge <- load_or_fit("fit_ridge.rds", train(
+  x = x_train, y = y_train,
+  method = "glmnet", metric = "ROC", trControl = ctrl,
+  tuneGrid = expand.grid(alpha = 0,                          # alpha = 0: ridge
+                         lambda = 10^seq(-3, 1, length.out = 40))))
+
+fit_ridge$bestTune                                           # should not be at the edge of the grid
+res_lin <- resamples(list(Lasso = fit_lasso, Ridge = fit_ridge))
+ridge_cmp <- data.frame(Method = c("Lasso", "Ridge"),
+                        CV_AUC_mean = round(c(mean(res_lin$values[["Lasso~ROC"]]),
+                                              mean(res_lin$values[["Ridge~ROC"]])), 3))
+ridge_cmp
+```
+
+Ridge reaches a cross-validated AUC of `r ridge_cmp$CV_AUC_mean[2]`, against
+`r ridge_cmp$CV_AUC_mean[1]` for the lasso. If the two are close, we keep the lasso, which
+also selects variables.
+
+# 11. Model assessment
+
+The chosen model (lasso) is now assessed **once** on the test set, which was not used for
+fitting or tuning. We report the AUC with the ROC curve, and the confusion matrix with
+sensitivity and specificity of the poor class.
+
+**Choice of the classification threshold.** The lasso outputs a probability of being poor. The
+default rule "poor if probability >= 0.5" is a poor fit for imbalanced data: with only 22%
+poor households the model tends to say "not poor". We therefore also use a second threshold
+that maximizes sensitivity + specificity (Youden index). To avoid using the test set for this
+choice, it is computed on out-of-fold predictions of the training set: each training household
+is predicted by a lasso (with the chosen lambda) that was fit on the other folds.
+
+```{r threshold}
+best_lambda <- fit_lasso$bestTune$lambda
+oof <- rep(NA_real_, nrow(x_train))
+for (f in folds) {                                  # f = rows used for fitting in this fold
+  hold  <- setdiff(seq_len(nrow(x_train)), f)       # rows held out in this fold
+  fit_f <- glmnet(x_train[f, ], y_train[f], family = "binomial",
+                  alpha = 1, lambda = best_lambda)
+  oof[hold] <- as.numeric(predict(fit_f, newx = x_train[hold, ], type = "response"))
+}
+
+roc_oof <- roc(y_train, oof, levels = c("not_poor", "poor"), direction = "<", quiet = TRUE)
+thr <- as.numeric(coords(roc_oof, x = "best", best.method = "youden",
+                         ret = "threshold", transpose = FALSE)[1, "threshold"])
+c(cv_AUC = as.numeric(auc(roc_oof)), chosen_threshold = thr)
+```
+
+```{r assessment}
+# predicted probability of being poor for the test households
+p_test   <- predict(fit_lasso, newdata = x_test, type = "prob")[, "poor"]
+roc_test <- roc(y_test, p_test, levels = c("not_poor", "poor"), direction = "<", quiet = TRUE)
+auc_test <- as.numeric(auc(roc_test))
+auc_ci   <- as.numeric(ci.auc(roc_test))            # 95% confidence interval
+c(AUC = auc_test, lower = auc_ci[1], upper = auc_ci[3])
+
+plot(roc_test, legacy.axes = TRUE, print.auc = TRUE,
+     main = "ROC curve of the lasso on the test set")
+
+# confusion matrix and measures for a given threshold
+assess <- function(prob, truth, cutoff) {
+  pred <- factor(ifelse(prob >= cutoff, "poor", "not_poor"), levels = c("not_poor", "poor"))
+  cm <- confusionMatrix(pred, truth, positive = "poor")
+  print(cm$table)
+  data.frame(Threshold   = round(cutoff, 3),
+             Accuracy    = round(unname(cm$overall["Accuracy"]), 3),
+             Sensitivity = round(unname(cm$byClass["Sensitivity"]), 3),   # poor households found
+             Specificity = round(unname(cm$byClass["Specificity"]), 3),   # not-poor households found
+             Precision   = round(unname(cm$byClass["Pos Pred Value"]), 3))
+}
+cat("Threshold 0.5\n");  r1 <- assess(p_test, y_test, 0.5)
+cat("\nThreshold chosen on the training set\n"); r2 <- assess(p_test, y_test, thr)
+res_tab <- rbind(r1, r2)
+knitr::kable(res_tab, row.names = FALSE, caption = "Test set: lasso at two thresholds")
+
+# benchmark: accuracy of the rule "nobody is poor"
+bench <- round(mean(y_test == "not_poor"), 3)
+bench
+```
+
+```{r test-auc-all}
+# for information only: test AUC of all three methods (not used for the selection)
+test_auc <- sapply(list(Lasso = fit_lasso, RandomForest = fit_rf, Boosting = fit_gbm),
+  function(m) {
+    p <- predict(m, newdata = x_test, type = "prob")[, "poor"]
+    as.numeric(auc(roc(y_test, p, levels = c("not_poor", "poor"), direction = "<", quiet = TRUE)))
+  })
+round(test_auc, 3)
+```
+
+**Results.** On the test set the lasso has an AUC of `r round(auc_test, 3)` (95% interval
+`r round(auc_ci[1], 3)` to `r round(auc_ci[3], 3)`), to be compared with the cross-validated
+`r cv_table$CV_AUC_mean[1]`. Similar values mean that the model generalizes and there is no
+sign of overfitting. The AUC is the probability that a randomly chosen poor household gets a
+higher score than a randomly chosen non-poor one.
+
+With the default threshold of 0.5 the model finds `r round(100 * res_tab$Sensitivity[1], 1)`%
+of the poor households (sensitivity) and `r round(100 * res_tab$Specificity[1], 1)`% of the
+non-poor ones (specificity). Its accuracy is `r round(100 * res_tab$Accuracy[1], 1)`%, to be
+compared with `r round(100 * bench, 1)`% for the rule "nobody is poor": accuracy alone says
+little here. With the threshold `r round(thr, 2)` chosen on the training set, sensitivity
+becomes `r round(100 * res_tab$Sensitivity[2], 1)`% and specificity
+`r round(100 * res_tab$Specificity[2], 1)`%: the model finds more poor households, at the
+price of wrongly flagging more non-poor ones (precision
+`r round(100 * res_tab$Precision[2], 1)`%). Which threshold is right is a **policy decision**,
+because wrongly excluding a poor household and wrongly including a non-poor one have different
+costs.
+
+# 12. Insights on the final model
+
+**Which characteristics are associated with poverty?** Every category has its own 0/1 column,
+and numeric variables enter as they are. A positive coefficient raises the probability of
+being poor, a negative one lowers it, holding the other variables fixed (the unit is the
+log-odds). Coefficients of different types of variables are not comparable in size: a numeric
+coefficient is the effect of one unit, a category coefficient is the effect of belonging to
+that category. We therefore also show the **effect per standard deviation** (the coefficient
+times the standard deviation of its column): it measures the effect of a typical difference
+and is automatically small for rare categories.
+
+```{r insights-lasso}
+cf <- as.matrix(coef(fit_lasso$finalModel, s = best_lambda))[-1, 1]   # drop the intercept
+cf <- cf[cf != 0]                                                      # columns kept
+col_var <- col_to_var(names(cf))
+eff <- data.frame(variable      = col_var,
+                  type          = unname(var_type[col_var]),
+                  column        = names(cf),
+                  coefficient   = unname(cf),
+                  effect_per_sd = unname(cf * apply(x_train[, names(cf), drop = FALSE], 2, sd)))
+eff$direction <- ifelse(eff$coefficient > 0, "more poor", "less poor")
+eff <- eff[order(-abs(eff$effect_per_sd)), ]
+rownames(eff) <- NULL
+nrow(eff)                                                              # columns kept by the lasso
+
+eff_show <- data.frame(
+  column        = eff$column,
+  coefficient   = formatC(eff$coefficient, format = "fg", digits = 3),   # no scientific notation
+  effect_per_sd = round(eff$effect_per_sd, 3))
+knitr::kable(head(eff_show, 15), row.names = FALSE, align = "lrr",
+             caption = "Lasso: the 15 largest effects per standard deviation (positive = more poor)")
+
+ggplot(head(eff, 15), aes(reorder(column, abs(effect_per_sd)), effect_per_sd, fill = direction)) +
+  geom_col() + coord_flip() +
+  labs(x = NULL, y = "Effect per standard deviation (log-odds)", fill = NULL)
+```
+
+The two tree-based models give a second view that does not depend on the linear form (the
+importance tables above). Their top-10 rankings:
+
+```{r importance-compare}
+top_rf  <- rownames(head(imp_rf, 10))
+top_gbm <- rownames(head(imp_gbm, 10))
+knitr::kable(data.frame(rank = 1:10, random_forest = top_rf, boosting = top_gbm))
+common <- intersect(top_rf, top_gbm)
+common                                          # variables in both top-10 lists
+```
+
+**What the model tells us**
+
+* The three largest lasso effects are `r paste(head(eff$column, 3), collapse = ", ")`. The
+  variables in the top 10 of both the random forest and boosting are
+  `r if (length(common) > 0) paste(common, collapse = ", ") else "none"`. Variables that
+  appear in several rankings are the most reliable signals.
+* The exploratory analysis pointed to education, household composition, crowding and dwelling
+  quality. Check in the tables above that the same groups of variables appear at the top; this
+  is what the logic of a proxy means test would suggest.
+* The lasso predicts about as well as the forest and boosting (test AUC: lasso
+  `r round(test_auc["Lasso"], 3)`, random forest `r round(test_auc["RandomForest"], 3)`,
+  boosting `r round(test_auc["Boosting"], 3)`). The relationship between the characteristics
+  and poverty is therefore mostly additive and roughly linear on the log-odds scale.
+
+**Limits of the model**
+
+* The results are **associations, not causal effects**: giving a household a computer would not
+  necessarily lift it out of poverty.
+* Coefficients are conditional on all other variables, and correlated variables can take
+  unexpected signs. For example `overcrowded_rooms` and `overcrowded_bedrooms` can get a
+  negative coefficient, although crowded households are poorer on their own, because
+  `persons_per_bedroom` already contains most of this information.
+* An AUC of about `r round(auc_test, 2)` is a moderate discrimination: the characteristics
+  predict poverty clearly better than chance (0.5), but a sizeable share of poor households
+  look like non-poor ones. This is the known limit of proxy means tests under informality.
+* The data describe the household head and the dwelling and come from one survey. The classes
+  are imbalanced, so the choice of the threshold matters as much as the choice of the method.
+* The test performance is estimated on one random split. A different split would give a
+  slightly different number; the cross-validated AUC and its spread show how much.
