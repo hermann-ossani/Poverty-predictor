@@ -1,12 +1,16 @@
 # =============================================================================
 # 01_clean_data.R
-# Costa Rican Household Poverty -- one clean row per household,
-# with explicit variable names
+# Costa Rican Household Poverty -- one clean row per household
 #
 # Input : costa-rican-household-poverty-prediction/train.csv
 #         (9,557 rows = persons, 143 columns)
-# Output: data/costa_rica_clean.RData  (contains the data frame `costa_rica`:
-#         one row per household, 43 predictors + the target `poor`)
+# Output: data/costa_rica_clean.RData with three objects:
+#   costa_rica        one row per household, readable categories (factors),
+#                     43 predictors + `poor`. Used for the exploratory analysis.
+#   costa_rica_model  the same households, ready for modelling: numeric columns,
+#                     one 0/1 column per category, rare 0/1 columns removed
+#                     (fewer than 30 households), + `poor`.
+#   removed_cols      the 0/1 columns that were removed and why
 #
 # Folder layout (Desktop/WU/Statistical and Machine Learning/Project):
 #   Project.Rproj
@@ -19,6 +23,8 @@
 #
 # Base R only, no packages needed.
 # =============================================================================
+
+min_n <- 30      # a 0/1 column needs at least this many households in each value
 
 # ---- 0. Read the data -------------------------------------------------------
 data_path <- "costa-rican-household-poverty-prediction/train.csv"
@@ -84,7 +90,7 @@ nrow(hh)                                   # 2970
 # ---- 5. Binary target -------------------------------------------------------
 # poor     = extreme or moderate poverty (original Target 1 or 2)
 # not_poor = vulnerable or non-vulnerable (original Target 3 or 4)
-table(hh$Target)                           # 222 / 442 / 355 / 1951 (for the slides)
+table(hh$Target)                           # 222 / 442 / 355 / 1951
 poor <- ifelse(hh$Target %in% c(1, 2), "poor", "not_poor")
 hh$poor <- factor(poor, levels = c("not_poor", "poor"))   # "poor" = event
 # The original 4-class Target is removed: left among the predictors it would
@@ -206,9 +212,11 @@ for (g in names(groups)) {
   hh[[g]] <- from_dummies(hh, groups[[g]]$cols, groups[[g]]$labels)
 }
 hh <- hh[, !(names(hh) %in% all_group_cols)]
-# Categories that do not cover all households get the extra label
+# Households that belong to none of the listed categories get the extra label
 # "not_recorded": roof_material (19 households), electricity_source (4),
-# head_education_level (1).
+# head_education_level (1). They are hidden missing values: all their 0/1
+# columns of that characteristic are 0.
+sapply(hh[sapply(hh, is.factor)], function(f) sum(f == "not_recorded"))
 
 
 # ---- 8. Explicit variable names ---------------------------------------------
@@ -260,20 +268,63 @@ col_order <- c(
   "poor"
 )
 stopifnot(setequal(col_order, names(hh)))
-hh <- hh[, col_order]
+hh <- hh[, col_order]                      # readable version (factors)
 
 
-# ---- 10. Checks and save ----------------------------------------------------
-stopifnot(!anyNA(hh))                      # no missing values left
-dim(hh)                                    # 2970 rows, 44 columns
-                                           # (43 predictors + poor)
-table(hh$poor)                             # 2306 not_poor / 664 poor
-prop.table(table(hh$poor))                 # about 22% poor
-table(sapply(hh[-ncol(hh)], function(x)    # 15 categorical, 10 binary, 18 numeric
+# ---- 10. Modelling data: one 0/1 column per category, rare columns removed ---
+# Each categorical variable becomes one 0/1 column per category, named
+# <variable>_<category> (e.g. wall_material_wood). No category is left out as a
+# reference: the penalty of the lasso/ridge handles the redundancy.
+cat_vars <- setdiff(names(hh)[sapply(hh, is.factor)], "poor")
+
+dummies <- do.call(cbind, lapply(cat_vars, function(v) {
+  f <- hh[[v]]
+  m <- sapply(levels(f), function(l) as.numeric(f == l))
+  colnames(m) <- paste(v, levels(f), sep = "_")
+  m
+}))
+
+costa_rica_model <- cbind(hh[, setdiff(names(hh), c(cat_vars, "poor"))], dummies)
+costa_rica_model$poor <- hh$poor           # target in the last column
+rownames(costa_rica_model) <- rownames(hh)
+
+# Remove 0/1 columns with too few observations: one of the two values (0 or 1)
+# occurs in fewer than `min_n` households, so its effect cannot be estimated
+# reliably. This covers rare categories (few 1s) and almost constant columns
+# (few 0s). No household is removed: households of a removed category simply
+# have 0 in all remaining columns of that variable. The target is not used.
+x_names <- setdiff(names(costa_rica_model), "poor")
+is01    <- sapply(costa_rica_model[x_names], function(x) all(x %in% c(0, 1)))
+bin_names <- x_names[is01]
+n_ones  <- colSums(costa_rica_model[bin_names])
+n_minor <- pmin(n_ones, nrow(costa_rica_model) - n_ones)   # size of the rarer value
+removed_cols <- data.frame(column = bin_names[n_minor < min_n],
+                           households_in_rarer_value = as.integer(n_minor[n_minor < min_n]),
+                           row.names = NULL)
+removed_cols <- removed_cols[order(removed_cols$households_in_rarer_value), ]
+rownames(removed_cols) <- NULL
+removed_cols                               # columns removed (fewer than 30 households)
+
+costa_rica_model <- costa_rica_model[, !(names(costa_rica_model) %in% removed_cols$column)]
+
+
+# ---- 11. Checks and save ----------------------------------------------------
+costa_rica <- hh                           # readable version, for the exploratory analysis
+
+stopifnot(!anyNA(costa_rica), !anyNA(costa_rica_model))   # no missing values
+stopifnot(identical(rownames(costa_rica), rownames(costa_rica_model)))   # same households
+stopifnot(identical(costa_rica$poor, costa_rica_model$poor))             # same target
+stopifnot(all(sapply(costa_rica_model[setdiff(names(costa_rica_model), "poor")], is.numeric)))
+
+dim(costa_rica)                            # 2970 rows, 44 columns (43 predictors + poor)
+dim(costa_rica_model)                      # 2970 rows, (number of numeric columns + dummies + poor)
+table(costa_rica$poor)                     # 2306 not_poor / 664 poor
+prop.table(table(costa_rica$poor))         # about 22% poor
+table(sapply(costa_rica[-ncol(costa_rica)], function(x)    # 15 categorical, 10 binary, 18 numeric
   if (is.factor(x)) "categorical" else if (all(x %in% c(0, 1))) "binary 0/1" else "numeric"))
 
-costa_rica <- hh                           # name of the object stored in the file
 dir.create("data", showWarnings = FALSE)   # output folder inside the project
-save(costa_rica, file = "data/costa_rica_clean.RData")  # keeps factors and row names
+save(costa_rica, costa_rica_model, removed_cols,
+     file = "data/costa_rica_clean.RData")  # keeps factors and row names
 # load it in any other script with:
-#   load("data/costa_rica_clean.RData")    # creates the object `costa_rica`
+#   load("data/costa_rica_clean.RData")    # creates costa_rica, costa_rica_model, removed_cols
